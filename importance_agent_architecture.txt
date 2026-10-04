@@ -1,0 +1,264 @@
+PYTHON PACKAGE ARCHITECTURE: IMPORTANCE AGENT
+===========================================
+
+Status: Proposed architecture only. Implementation has not started.
+Proposed import name: importance_agent (not a claim of package-name availability).
+
+1. PURPOSE
+----------
+A Python package that evaluates news or other supplied information against
+user-defined instructions and returns an integer importance score from 1 to 100,
+with an explanation grounded in the supplied data.
+
+Importance is relative to your instructions, not an objective truth score.
+For example, the same news may be highly important to a supply-chain manager
+and unimportant to someone evaluating local sports events.
+
+2. PUBLIC INPUTS AND OUTPUTS
+---------------------------
+Inputs:
+- Data: text, or a JSON-compatible dictionary containing the information.
+- Instructions: what matters, to whom, over what time horizon, and why.
+- Provider configuration: API base URL, model, API-key environment-variable
+  name, timeout, retry limit, and optional provider-specific settings.
+- Optional rubric: explicit criteria, weights, and rating anchors.
+- Optional metadata: item ID, source, publication time, and evaluation time.
+
+Successful result:
+- importance: integer from 1 to 100.
+- explanation: concise justification for the overall score.
+- criteria: individual ratings, weights, reasons, and supporting excerpts.
+- missing_information: relevant gaps in the supplied data.
+- rubric_id, provider, model, and evaluation timestamp for traceability.
+
+Failure result:
+- A typed error for invalid input, authentication, rate limits, oversized
+  content, transport failures, or invalid model output.
+- Never return a fabricated importance score when evaluation fails.
+
+3. ARCHITECTURE AND DATA FLOW
+-----------------------------
+                      SETUP / REUSED BETWEEN ITEMS
+User instructions + optional explicit rubric
+                    |
+                    v
+            Rubric builder and validator
+                    |
+                    v
+          Stored, versioned evaluation rubric
+
+                          EACH EVALUATION
+Data + metadata + rubric + provider configuration
+                    |
+                    v
+           Input validation and normalization
+                    |
+                    v
+                Prompt builder
+       Separates instructions from untrusted data
+                    |
+                    v
+             Provider adapter interface
+                    |
+          +---------+-------------------+
+          |                             |
+          v                             v
+  Chat-compatible HTTP adapter    Custom provider adapter
+          |                             |
+          +--------------+--------------+
+                         |
+                         v
+               Configured AI model API
+                         |
+                         v
+             Structured response validator
+                         |
+                         v
+          Deterministic weighted-score calculator
+                         |
+                         v
+              EvaluationResult / JSON
+
+This is a bounded evaluation workflow: the model assesses supplied content.
+It does not need autonomous browsing, tool execution, or long-term memory.
+
+4. MAIN COMPONENTS
+------------------
+ImportanceAgent:
+  Public Python interface. Coordinates preparation, evaluation, and batches.
+
+InputNormalizer:
+  Converts text or dictionaries into a stable representation. Rejects empty
+  or oversized input; preserves source metadata. No silent truncation.
+
+RubricBuilder:
+  Accepts an explicit rubric, or uses the configured model to turn instructions
+  into criteria, weights, and anchors. Validates and exposes the rubric before
+  reuse. Reuses that rubric rather than inventing new criteria for every item.
+  Changed instructions produce a new rubric version.
+
+PromptBuilder:
+  Supplies the rubric and required response schema. Treats all submitted news
+  and information as data, including embedded requests to change the rules.
+
+ProviderAdapter:
+  Encapsulates authentication, request formatting, response extraction, and
+  provider errors. Uses native structured output when available, otherwise
+  requests JSON and validates it locally.
+
+ResponseValidator:
+  Checks required fields, exact criterion IDs, integer ratings within 1..100,
+  and evidence excerpts against the input. Rejects missing/duplicate criteria
+  and provider attempts to change weights. Allows at most one repair request
+  for malformed output; persistent failures become typed errors.
+
+ScoreCalculator:
+  Computes the final score in Python using the stored rubric weights.
+  The model supplies criterion ratings and reasons, not the authoritative
+  final arithmetic.
+
+ResultModels:
+  Typed configuration, input, rubric, criterion result, and evaluation result
+  objects, with dictionary/JSON serialization.
+
+5. HOW SCORING WORKS
+-------------------
+Each criterion receives a rating from 1 to 100, using rubric-specific anchors.
+Weights must be positive and total 1.0 within a documented numeric tolerance.
+
+importance = round_half_up(sum(weight * criterion_rating) / sum(weights))
+
+Example rubric for evaluating operational news:
+- Relevance to the user's operations: 0.40
+- Size of the potential impact:       0.35
+- Urgency of action:                  0.25
+
+Example ratings of 90, 80, and 60 produce:
+0.40 * 90 + 0.35 * 80 + 0.25 * 60 = 79
+
+General anchors, refined for each criterion by the rubric:
+- 1: negligible importance for the stated objective.
+- 25: low importance.
+- 50: moderate importance.
+- 75: high importance.
+- 100: critical importance requiring immediate attention under the rubric.
+
+Missing-information handling belongs in the rubric. The explanation must
+identify gaps; missing evidence is not automatically evidence of low impact.
+If the rubric requires information that is absent and permits no fallback,
+return an insufficient-information error rather than inventing a rating.
+
+Scores are comparable primarily within the same rubric and model configuration.
+The score is a judgment, not a probability. Model output may vary even with
+low randomness. Supplied claims are not independently fact-checked in v1.
+
+6. CONFIGURABLE FREE API SUPPORT
+-------------------------------
+There is no hard-coded API vendor. Configure the endpoint, model, credentials,
+and adapter. The package can use a free-tier API when that API supports the
+required text-generation task and the user has access.
+
+The initial generic adapter targets a documented chat-style JSON request and
+response format. APIs with different formats need a small custom adapter;
+changing the base URL alone cannot make every API compatible.
+
+API availability, pricing, model access, and quotas belong to the provider.
+The package cannot guarantee that a configured API remains free.
+
+Store credentials in environment variables, never in prompts or result files.
+Configure bounded retries with backoff for transient failures and rate limits;
+honor Retry-After when supplied. Do not retry invalid credentials. Do not
+silently switch providers, since that changes data routing and score behavior.
+
+7. PROPOSED PACKAGE STRUCTURE
+----------------------------
+pyproject.toml
+README.md
+src/importance_agent/
+    __init__.py          Public exports
+    agent.py             Preparation and evaluation workflow
+    models.py            Typed inputs, configuration, rubrics, and results
+    rubric.py            Rubric creation, validation, and versioning
+    prompts.py           Prompt templates and data separation
+    validation.py        Model-response and evidence validation
+    scoring.py           Weighted score calculation
+    errors.py            Typed package exceptions
+    providers/
+        base.py          Adapter contract
+        chat.py          Generic chat-style HTTP adapter
+examples/
+    evaluate_news.py
+    custom_provider.py
+tests/
+    test_scoring.py
+    test_validation.py
+    test_agent.py
+    test_providers.py
+
+Keep the core lightweight: Python data classes, JSON handling, and a shared
+HTTP transport. No database, web server, or agent framework is required.
+
+8. PROPOSED PYTHON USAGE (ILLUSTRATIVE; NOT IMPLEMENTED)
+----------------------------------------------------
+from importance_agent import ImportanceAgent, ProviderConfig
+
+agent = ImportanceAgent(
+    provider=ProviderConfig(
+        adapter="chat",
+        base_url="https://your-provider.example/v1",
+        model="your-model-name",
+        api_key_env="IMPORTANCE_API_KEY",
+        timeout_seconds=30,
+        max_retries=2,
+    ),
+    instructions=(
+        "Evaluate importance to our manufacturing operations over the next "
+        "7 days. Prioritize relevance, operational impact, and urgency."
+    ),
+)
+
+rubric = agent.prepare()  # Creates once; inspect or serialize for reuse.
+
+result = agent.evaluate({
+    "title": "Major supplier announces a temporary factory shutdown",
+    "body": "The shutdown starts tomorrow and is expected to last five days.",
+    "source": "Supplier announcement",
+})
+
+print(result.importance)   # Integer in 1..100 on successful evaluation.
+print(result.explanation)
+print(result.to_dict())
+
+# A batch shares the same rubric and returns results/errors in input order.
+batch = agent.evaluate_many(["First information item", "Second item"])
+
+9. RELIABILITY AND DATA HANDLING
+------------------------------
+- Send the supplied content and rubric to the explicitly configured provider.
+- Do not log API keys or full input content by default.
+- Bound request duration, retries, response size, and batch concurrency.
+- Validate outputs locally regardless of structured-output API support.
+- Reject unsupported input sizes with a clear error. Chunking and summarizing
+  long documents can be added later with explicit aggregation rules.
+- Version rubrics and record model/configuration provenance for comparisons.
+- Prompt separation reduces injection risk but does not guarantee immunity;
+  submitted content has no access to tools, credentials, or external actions.
+
+10. IMPLEMENTATION SCOPE AND VERIFICATION
+---------------------------------------
+First version:
+1. Package skeleton, public models, configuration, and typed errors.
+2. Generic chat adapter plus custom-adapter interface.
+3. Reusable rubric preparation and single-item scoring pipeline.
+4. Ordered batch evaluation with per-item failures.
+5. Documentation and runnable examples.
+
+Tests should cover weighted scoring and boundaries, invalid rubrics, malformed
+responses, fabricated evidence, empty/oversized input, timeouts, rate limits,
+and batch error isolation. Use a fake provider for repeatable automated tests.
+
+Assess scoring quality separately on a small set of user-rated examples.
+Passing software tests does not establish the quality of model judgments.
+
+Later options: local-model adapters, file/PDF ingestion, a CLI, caching,
+long-document processing, and optional source verification.
